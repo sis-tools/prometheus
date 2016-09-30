@@ -26,6 +26,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
+	"golang.org/x/net/context"
+
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
@@ -95,31 +97,37 @@ func Main() int {
 		log.Errorf("Error initializing remote storage: %s", err)
 		return 1
 	}
-
 	if remoteStorage != nil {
 		sampleAppender = append(sampleAppender, remoteStorage)
 		reloadables = append(reloadables, remoteStorage)
 	}
 
+	reloadableRemoteStorage := remote.NewConfigurable()
+	sampleAppender = append(sampleAppender, reloadableRemoteStorage)
+	reloadables = append(reloadables, reloadableRemoteStorage)
+
 	var (
-		notifier      = notifier.New(&cfg.notifier)
-		targetManager = retrieval.NewTargetManager(sampleAppender)
-		queryEngine   = promql.NewEngine(localStorage, &cfg.queryEngine)
+		notifier       = notifier.New(&cfg.notifier)
+		targetManager  = retrieval.NewTargetManager(sampleAppender)
+		queryEngine    = promql.NewEngine(localStorage, &cfg.queryEngine)
+		ctx, cancelCtx = context.WithCancel(context.Background())
 	)
 
 	ruleManager := rules.NewManager(&rules.ManagerOptions{
 		SampleAppender: sampleAppender,
 		Notifier:       notifier,
 		QueryEngine:    queryEngine,
+		Context:        ctx,
 		ExternalURL:    cfg.web.ExternalURL,
 	})
 
-	flags := map[string]string{}
-	cfg.fs.VisitAll(func(f *flag.Flag) {
-		flags[f.Name] = f.Value.String()
-	})
+	cfg.web.Context = ctx
+	cfg.web.Storage = localStorage
+	cfg.web.QueryEngine = queryEngine
+	cfg.web.TargetManager = targetManager
+	cfg.web.RuleManager = ruleManager
 
-	version := &web.PrometheusVersion{
+	cfg.web.Version = &web.PrometheusVersion{
 		Version:   version.Version,
 		Revision:  version.Revision,
 		Branch:    version.Branch,
@@ -128,7 +136,12 @@ func Main() int {
 		GoVersion: version.GoVersion,
 	}
 
-	webHandler := web.New(localStorage, queryEngine, targetManager, ruleManager, version, flags, &cfg.web)
+	cfg.web.Flags = map[string]string{}
+	cfg.fs.VisitAll(func(f *flag.Flag) {
+		cfg.web.Flags[f.Name] = f.Value.String()
+	})
+
+	webHandler := web.New(&cfg.web)
 
 	reloadables = append(reloadables, targetManager, ruleManager, webHandler, notifier)
 
@@ -175,11 +188,12 @@ func Main() int {
 	}()
 
 	if remoteStorage != nil {
-		prometheus.MustRegister(remoteStorage)
-
-		go remoteStorage.Run()
+		remoteStorage.Start()
 		defer remoteStorage.Stop()
 	}
+
+	defer reloadableRemoteStorage.Stop()
+
 	// The storage has to be fully initialized before registering.
 	if instrumentedStorage, ok := localStorage.(prometheus.Collector); ok {
 		prometheus.MustRegister(instrumentedStorage)
@@ -188,7 +202,7 @@ func Main() int {
 	prometheus.MustRegister(configSuccess)
 	prometheus.MustRegister(configSuccessTime)
 
-	// The notifieris a dependency of the rule manager. It has to be
+	// The notifier is a dependency of the rule manager. It has to be
 	// started before and torn down afterwards.
 	go notifier.Run()
 	defer notifier.Stop()
@@ -201,7 +215,7 @@ func Main() int {
 
 	// Shutting down the query engine before the rule manager will cause pending queries
 	// to be canceled and ensures a quick shutdown of the rule manager.
-	defer queryEngine.Stop()
+	defer cancelCtx()
 
 	go webHandler.Run()
 

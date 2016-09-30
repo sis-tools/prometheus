@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
+	"golang.org/x/net/context"
 
 	"github.com/prometheus/prometheus/storage/metric"
 )
@@ -89,7 +90,7 @@ var (
 )
 
 type evictRequest struct {
-	cd    *chunkDesc
+	cd    *ChunkDesc
 	evict bool
 }
 
@@ -413,7 +414,7 @@ func (s *MemorySeriesStorage) WaitForIndexing() {
 }
 
 // LastSampleForLabelMatchers implements Storage.
-func (s *MemorySeriesStorage) LastSampleForLabelMatchers(cutoff model.Time, matcherSets ...metric.LabelMatchers) (model.Vector, error) {
+func (s *MemorySeriesStorage) LastSampleForLabelMatchers(_ context.Context, cutoff model.Time, matcherSets ...metric.LabelMatchers) (model.Vector, error) {
 	fps := map[model.Fingerprint]struct{}{}
 	for _, matchers := range matcherSets {
 		fpToMetric, err := s.metricsForLabelMatchers(cutoff, model.Latest, matchers...)
@@ -483,7 +484,7 @@ func (bit *boundedIterator) Close() {
 }
 
 // QueryRange implements Storage.
-func (s *MemorySeriesStorage) QueryRange(from, through model.Time, matchers ...*metric.LabelMatcher) ([]SeriesIterator, error) {
+func (s *MemorySeriesStorage) QueryRange(_ context.Context, from, through model.Time, matchers ...*metric.LabelMatcher) ([]SeriesIterator, error) {
 	fpToMetric, err := s.metricsForLabelMatchers(from, through, matchers...)
 	if err != nil {
 		return nil, err
@@ -497,7 +498,7 @@ func (s *MemorySeriesStorage) QueryRange(from, through model.Time, matchers ...*
 }
 
 // QueryInstant implements Storage.
-func (s *MemorySeriesStorage) QueryInstant(ts model.Time, stalenessDelta time.Duration, matchers ...*metric.LabelMatcher) ([]SeriesIterator, error) {
+func (s *MemorySeriesStorage) QueryInstant(_ context.Context, ts model.Time, stalenessDelta time.Duration, matchers ...*metric.LabelMatcher) ([]SeriesIterator, error) {
 	from := ts.Add(-stalenessDelta)
 	through := ts
 
@@ -540,6 +541,7 @@ func (s *MemorySeriesStorage) fingerprintsForLabelPair(
 
 // MetricsForLabelMatchers implements Storage.
 func (s *MemorySeriesStorage) MetricsForLabelMatchers(
+	_ context.Context,
 	from, through model.Time,
 	matcherSets ...metric.LabelMatchers,
 ) ([]metric.Metric, error) {
@@ -603,7 +605,7 @@ func (s *MemorySeriesStorage) metricsForLabelMatchers(
 			break
 		}
 
-		lvs, err := s.LabelValuesForLabelName(m.Name)
+		lvs, err := s.LabelValuesForLabelName(context.TODO(), m.Name)
 		if err != nil {
 			return nil, err
 		}
@@ -660,7 +662,7 @@ func (s *MemorySeriesStorage) metricForRange(
 ) (model.Metric, *memorySeries, bool) {
 	series, ok := s.fpToSeries.get(fp)
 	if ok {
-		if series.lastTime.Before(from) || series.firstTime().After(through) {
+		if series.lastTime.Before(from) || series.FirstTime().After(through) {
 			return nil, nil, false
 		}
 		return series.metric, series, true
@@ -693,12 +695,12 @@ func (s *MemorySeriesStorage) metricForRange(
 }
 
 // LabelValuesForLabelName implements Storage.
-func (s *MemorySeriesStorage) LabelValuesForLabelName(labelName model.LabelName) (model.LabelValues, error) {
+func (s *MemorySeriesStorage) LabelValuesForLabelName(_ context.Context, labelName model.LabelName) (model.LabelValues, error) {
 	return s.persistence.labelValuesForLabelName(labelName)
 }
 
 // DropMetricsForLabelMatchers implements Storage.
-func (s *MemorySeriesStorage) DropMetricsForLabelMatchers(matchers ...*metric.LabelMatcher) (int, error) {
+func (s *MemorySeriesStorage) DropMetricsForLabelMatchers(_ context.Context, matchers ...*metric.LabelMatcher) (int, error) {
 	fpToMetric, err := s.metricsForLabelMatchers(model.Earliest, model.Latest, matchers...)
 	if err != nil {
 		return 0, err
@@ -760,7 +762,7 @@ func (s *MemorySeriesStorage) Append(sample *model.Sample) error {
 		s.discardedSamplesCount.WithLabelValues(outOfOrderTimestamp).Inc()
 		return ErrOutOfOrderSample // Caused by the caller.
 	}
-	completedChunksCount, err := series.add(model.SamplePair{
+	completedChunksCount, err := series.Add(model.SamplePair{
 		Value:     sample.Value,
 		Timestamp: sample.Timestamp,
 	})
@@ -831,7 +833,7 @@ func (s *MemorySeriesStorage) logThrottling() {
 func (s *MemorySeriesStorage) getOrCreateSeries(fp model.Fingerprint, m model.Metric) (*memorySeries, error) {
 	series, ok := s.fpToSeries.get(fp)
 	if !ok {
-		var cds []*chunkDesc
+		var cds []*ChunkDesc
 		var modTime time.Time
 		unarchived, err := s.persistence.unarchiveMetric(fp)
 		if err != nil {
@@ -973,13 +975,13 @@ func (s *MemorySeriesStorage) maybeEvict() {
 	if numChunksToEvict <= 0 {
 		return
 	}
-	chunkDescsToEvict := make([]*chunkDesc, numChunksToEvict)
+	chunkDescsToEvict := make([]*ChunkDesc, numChunksToEvict)
 	for i := range chunkDescsToEvict {
 		e := s.evictList.Front()
 		if e == nil {
 			break
 		}
-		cd := e.Value.(*chunkDesc)
+		cd := e.Value.(*ChunkDesc)
 		cd.evictListElement = nil
 		chunkDescsToEvict[i] = cd
 		s.evictList.Remove(e)
@@ -1267,7 +1269,7 @@ func (s *MemorySeriesStorage) maintainMemorySeries(
 	if iOldestNotEvicted == -1 && model.Now().Sub(series.lastTime) > headChunkTimeout {
 		s.fpToSeries.del(fp)
 		s.numSeries.Dec()
-		s.persistence.archiveMetric(fp, series.metric, series.firstTime(), series.lastTime)
+		s.persistence.archiveMetric(fp, series.metric, series.FirstTime(), series.lastTime)
 		s.seriesOps.WithLabelValues(archive).Inc()
 		oldWatermark := atomic.LoadInt64((*int64)(&s.archiveHighWatermark))
 		if oldWatermark < int64(series.lastTime) {
@@ -1323,12 +1325,12 @@ func (s *MemorySeriesStorage) writeMemorySeries(
 
 	// Get the actual chunks from underneath the chunkDescs.
 	// No lock required as chunks still to persist cannot be evicted.
-	chunks := make([]chunk, len(cds))
+	chunks := make([]Chunk, len(cds))
 	for i, cd := range cds {
 		chunks[i] = cd.c
 	}
 
-	if !series.firstTime().Before(beforeTime) {
+	if !series.FirstTime().Before(beforeTime) {
 		// Oldest sample not old enough, just append chunks, if any.
 		if len(cds) == 0 {
 			return false
@@ -1411,12 +1413,12 @@ func (s *MemorySeriesStorage) maintainArchivedSeries(fp model.Fingerprint, befor
 }
 
 // See persistence.loadChunks for detailed explanation.
-func (s *MemorySeriesStorage) loadChunks(fp model.Fingerprint, indexes []int, indexOffset int) ([]chunk, error) {
+func (s *MemorySeriesStorage) loadChunks(fp model.Fingerprint, indexes []int, indexOffset int) ([]Chunk, error) {
 	return s.persistence.loadChunks(fp, indexes, indexOffset)
 }
 
 // See persistence.loadChunkDescs for detailed explanation.
-func (s *MemorySeriesStorage) loadChunkDescs(fp model.Fingerprint, offsetFromEnd int) ([]*chunkDesc, error) {
+func (s *MemorySeriesStorage) loadChunkDescs(fp model.Fingerprint, offsetFromEnd int) ([]*ChunkDesc, error) {
 	return s.persistence.loadChunkDescs(fp, offsetFromEnd)
 }
 
